@@ -1,0 +1,164 @@
+	#!/bin/bash
+	#$ -pe smp 4
+	#4 -l gpu=2
+
+import torch,numpy,random,math
+import sys
+from torch.utils.data import DataLoader
+from dataset import PTBDataset
+from padding import PadIntVecIntVec
+
+torch.manual_seed(200206459)
+random.seed(200206459)
+numpy.random.seed(200206459)
+numpy.set_printoptions(threshold=sys.maxsize)
+torch.set_printoptions(precision=2,edgeitems=500,linewidth=500)
+import time
+start_time=time.time()
+def rnn_forward(rnn_cell,init_state,input):
+  output,HT=rnn_cell(input,init_state)
+  return input,output
+
+def backward_masks(lengths):
+		batch_size=len(lengths)
+		maxlen=max(lengths)
+		mask_rows=torch.zeros([maxlen,batch_size],dtype=torch.long)
+		mask_cols=torch.zeros([maxlen,batch_size],dtype=torch.long)
+		for i in range(len(lengths)):
+			mask_rows[0:lengths[i],i]=torch.flip(torch.arange(0,lengths[i]),[0])
+			mask_cols[:,i]=i
+		return mask_rows,mask_cols
+
+def rnn_backward(inverse_matrix,bias,output,lengths,state_size,embedding_size):
+		batch_size=len(lengths)
+		mask_rows,mask_cols=backward_masks(lengths)
+		reverse_output=output[mask_rows,mask_cols,]
+		h=reverse_output[0]
+		H=[h]
+		X=[]
+		for i in range(output.size()[0]):
+			h=torch.clip(h,-0.999,0.999)
+			hx=torch.matmul(inverse_matrix,torch.transpose(torch.atanh(h)-bias,0,1))
+			hx=torch.clip(hx,-0.999,0.999)  
+			h,x=torch.split(hx,(state_size,embedding_size))
+			h=torch.transpose(h,0,1)
+			x=torch.transpose(x,0,1)
+			H.insert(0,h)
+			X.insert(0,x)
+		X=torch.stack(X)
+		H=torch.stack(H)
+		return X,H
+def rnn_backward_parameters(rnn_cell):
+		rnn_parameters={}
+		for name,parameters in rnn_cell.named_parameters():
+			rnn_parameters[name]=parameters
+		A=torch.cat((rnn_parameters["weight_hh_l0"],rnn_parameters["weight_ih_l0"]),1)
+		AT=torch.transpose(A,0,1)
+		k=A@AT
+		print(k.shape)
+		Ai=torch.mm(AT,torch.inverse(torch.mm(A,AT)))
+		b=(rnn_parameters["bias_hh_l0"]+rnn_parameters["bias_ih_l0"])
+		return Ai,b
+		
+
+def init_rnn_parameters(rnn_cell,left,right):
+		for name,parameters in rnn_cell.named_parameters():
+			if "bias" in name:
+				torch.nn.init.constant_(parameters,0.0)
+			elif "weight" in name:
+				torch.nn.init.uniform(parameters,left,right)
+			print(name,parameters)
+
+def init_embeddings(embedding,mean,std):
+		torch.nn.init.normal_(embedding.weight,mean,std)
+
+def topk_accuracy(model,init_state,data_loader,state_size,embedding_size):
+		# if model was trained pause and restore the state at the end
+		if model.training: training=True
+		else: training=False
+		if training: model.eval()
+		correct_prediction=total_prediction=0.0
+		with torch.no_grad():
+			embedding_matrix=model[0]
+			rnn_cell=model[1]
+	   
+			Ai,b=rnn_backward_parameters(rnn_cell)
+			for i,batch in enumerate(data_loader,0):
+				features,labels,lengths=batch
+				batch_size=len(lengths)
+				embeddings=embedding_matrix(torch.tensor(features)).permute(1,0,2)
+				_,output=rnn_forward(rnn_cell,init_state[:,0:batch_size,],embeddings)
+				predicted_embeddings,_=rnn_backward(Ai,b,output,lengths,state_size,embedding_size)
+				for b in range(batch_size):
+					for l in range(lengths[b]):
+						# Euclidean distance
+						#predicted_index=torch.linalg.norm(embedding_matrix.weight-predicted_embeddings[l][b],dim=1).argmin()
+						# cosine distance
+						predicted_index=torch.linalg.norm(embedding_matrix.weight/torch.linalg.norm(embedding_matrix.weight)-predicted_embeddings[l][b]/torch.linalg.norm(predicted_embeddings[l][b]),dim=1).argmin()
+						if features[b][l]==predicted_index: correct_prediction=(correct_prediction+1.0)
+						total_prediction=(total_prediction+1.0)
+		if training: model.train()
+		return correct_prediction/total_prediction
+N=100 # number of training epochs
+B=32 # batch size
+V=10002 # vocabulary size
+E=500# size of embedding
+H=500 # size of hidden/history state
+embedding_matrix=torch.nn.Embedding(V,E,padding_idx=V-1)
+#init_embeddings(embedding_matrix,0.0,0.1) # initialise embedding matrix differenty to default
+embedding_matrix.weight.requires_grad_(False) # do not update embedding matrix
+
+rnn_cell=torch.nn.RNN(E,H)
+rnn_cell=rnn_cell
+print(rnn_cell)
+#init_rnn_parameters(rnn_cell,-math.sqrt(1.0/H),math.sqrt(1.0/H)) # initialise RNN differently to default
+H0=torch.zeros(1,B,H)
+train_data=PTBDataset("../Data/ptb/train.txt","../Data/ptb/words.txt")
+valid_data=PTBDataset("../Data/ptb/valid.txt","../Data/ptb/words.txt")
+test_data=PTBDataset("../Data/ptb/test.txt","../Data/ptb/words.txt")
+train_loader=DataLoader(train_data,batch_size=B,shuffle=True,collate_fn=PadIntVecIntVec(V-1),drop_last=True)
+test_loader=DataLoader(test_data,batch_size=B,shuffle=False,collate_fn=PadIntVecIntVec(V-1),drop_last=False)
+
+alpha=1.0# weights for embedding loss and state loss
+beta=1.0
+model=torch.nn.ModuleList()
+model.append(embedding_matrix)
+model.append(rnn_cell)
+
+optimiser=torch.optim.SGD(model.parameters(),lr=0.0001,momentum=0.9)
+loss=torch.nn.MSELoss(reduction="none")
+for e in range(N):
+	epoch_loss=epoch_batch=epoch_embedding_loss=epoch_state_loss=0.0
+	for i,batch in enumerate(train_loader,0):
+			optimiser.zero_grad()
+			features,labels,lengths=batch
+			embeddings=embedding_matrix(torch.tensor(features)).permute(1,0,2)
+			_,output=rnn_forward(rnn_cell,H0,embeddings)
+			Ai,b=rnn_backward_parameters(rnn_cell)
+			predicted_embeddings,predicted_output=rnn_backward(Ai,b,output,lengths,H,E)
+			output=torch.cat((H0,output))
+			# compute embedding reconstruction loss
+			embedding_loss=loss(embeddings.permute(1,0,2),predicted_embeddings.permute(1,0,2))
+			embedding_loss=torch.sum(embedding_loss,2)
+			embedding_mask=~torch.eq(torch.tensor(features),V-1)
+			embedding_loss=torch.masked_select(embedding_loss,embedding_mask)
+			embedding_loss=torch.mean(embedding_loss)/E
+			# compute recurrent state reconstruction loss
+			state_loss=loss(output.permute(1,0,2),predicted_output.permute(1,0,2))
+			state_loss=torch.sum(state_loss,2)
+			true_column=torch.tensor((),dtype=torch.bool).new_ones((B,1))
+			state_mask=torch.cat((true_column,embedding_mask),1)
+			state_loss=torch.masked_select(state_loss,state_mask)
+			state_loss=torch.mean(state_loss)/H
+			batch_loss=(alpha*embedding_loss+beta*state_loss)
+			if torch.isnan(batch_loss).any(): raise ValueError("Loss is NaN. Exiting...")
+			if torch.isinf(batch_loss).any(): raise ValueError("Loss is Inf. Exiting...")
+			batch_loss.backward()
+			optimiser.step()
+			epoch_loss=epoch_loss+batch_loss.item()
+			epoch_batch=epoch_batch+1.0
+			epoch_embedding_loss=epoch_embedding_loss+embedding_loss.item()
+			epoch_state_loss=epoch_state_loss+state_loss.item()
+	print("Epoch",e,"loss",epoch_loss/epoch_batch,"embedding",epoch_embedding_loss/epoch_batch,"state",epoch_state_loss/epoch_batch)
+		#print("Top-1 accuracy",100*topk_accuracy(model,H0,test_loader,H,E),"%")
+print("%s seconds" % (time.time() - start_time))
