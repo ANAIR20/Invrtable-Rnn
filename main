@@ -3,7 +3,6 @@
 	#4 -l gpu=2
 
 import torch,numpy,random,math
-import sys
 from torch.utils.data import DataLoader
 from dataset import PTBDataset
 from padding import PadIntVecIntVec
@@ -11,14 +10,14 @@ from padding import PadIntVecIntVec
 torch.manual_seed(200206459)
 random.seed(200206459)
 numpy.random.seed(200206459)
-numpy.set_printoptions(threshold=sys.maxsize)
 torch.set_printoptions(precision=2,edgeitems=500,linewidth=500)
 import time
 start_time=time.time()
 def rnn_forward(rnn_cell,init_state,input):
   output,HT=rnn_cell(input,init_state)
   return input,output
-
+def compute_l2_loss(w):
+	return torch.square(w).sum()
 def backward_masks(lengths):
 		batch_size=len(lengths)
 		maxlen=max(lengths)
@@ -32,7 +31,7 @@ def backward_masks(lengths):
 def rnn_backward(inverse_matrix,bias,output,lengths,state_size,embedding_size):
 		batch_size=len(lengths)
 		mask_rows,mask_cols=backward_masks(lengths)
-		reverse_output=output[mask_rows,mask_cols,]
+		reverse_output=output[mask_rows,mask_cols]
 		h=reverse_output[0]
 		H=[h]
 		X=[]
@@ -48,18 +47,19 @@ def rnn_backward(inverse_matrix,bias,output,lengths,state_size,embedding_size):
 		X=torch.stack(X)
 		H=torch.stack(H)
 		return X,H
-def rnn_backward_parameters(rnn_cell):
-		rnn_parameters={}
-		for name,parameters in rnn_cell.named_parameters():
-			rnn_parameters[name]=parameters
+
+def rnn_backward_parameters(rnn_cell,rnn_parameters):
+		#v=rnn_parameters["weight_hh_l0"]
+		#(v)
 		A=torch.cat((rnn_parameters["weight_hh_l0"],rnn_parameters["weight_ih_l0"]),1)
+		#B=torch.square(A)
+		print(torch.norm(rnn_parameters["weight_hh_l0"])/(E*H))
 		AT=torch.transpose(A,0,1)
-		k=A@AT
-		print(k.shape)
-		Ai=torch.mm(AT,torch.inverse(torch.mm(A,AT)))
+		#print(A)
+		Ai=torch.mm(AT,torch.inverse(torch.mm(A,AT))) # changed from to matmul
+		#print(Ai)
 		b=(rnn_parameters["bias_hh_l0"]+rnn_parameters["bias_ih_l0"])
 		return Ai,b
-		
 
 def init_rnn_parameters(rnn_cell,left,right):
 		for name,parameters in rnn_cell.named_parameters():
@@ -82,7 +82,7 @@ def topk_accuracy(model,init_state,data_loader,state_size,embedding_size):
 			embedding_matrix=model[0]
 			rnn_cell=model[1]
 	   
-			Ai,b=rnn_backward_parameters(rnn_cell)
+			Ai,b=rnn_backward_parameters(rnn_cell,rnn_parameters)
 			for i,batch in enumerate(data_loader,0):
 				features,labels,lengths=batch
 				batch_size=len(lengths)
@@ -107,12 +107,16 @@ H=500 # size of hidden/history state
 embedding_matrix=torch.nn.Embedding(V,E,padding_idx=V-1)
 #init_embeddings(embedding_matrix,0.0,0.1) # initialise embedding matrix differenty to default
 embedding_matrix.weight.requires_grad_(False) # do not update embedding matrix
-
 rnn_cell=torch.nn.RNN(E,H)
-rnn_cell=rnn_cell
+rnn_cell=rnn_cell.cuda()
 print(rnn_cell)
+rnn_parameters={}
+for name,parameters in rnn_cell.named_parameters():
+	rnn_parameters[name]=parameters
+#compute_l2_loss(rnn_parameters["weight_hh_l0"]),compute_l2_loss(rnn_parameters["weight_ih_l0"])
+#print(torch.norm(rnn_parameters["weight_hh_l0"])/(H*H))
 #init_rnn_parameters(rnn_cell,-math.sqrt(1.0/H),math.sqrt(1.0/H)) # initialise RNN differently to default
-H0=torch.zeros(1,B,H)
+H0=torch.zeros(1,B,H).cuda()
 train_data=PTBDataset("../Data/ptb/train.txt","../Data/ptb/words.txt")
 valid_data=PTBDataset("../Data/ptb/valid.txt","../Data/ptb/words.txt")
 test_data=PTBDataset("../Data/ptb/test.txt","../Data/ptb/words.txt")
@@ -121,39 +125,47 @@ test_loader=DataLoader(test_data,batch_size=B,shuffle=False,collate_fn=PadIntVec
 
 alpha=1.0# weights for embedding loss and state loss
 beta=1.0
+gamma_ih=1.0
+gamma_hh=1.0
 model=torch.nn.ModuleList()
 model.append(embedding_matrix)
 model.append(rnn_cell)
 
-optimiser=torch.optim.SGD(model.parameters(),lr=0.0001,momentum=0.9)
+optimiser=torch.optim.SGD(model.parameters(),lr=0.0001,momentum=0.9,weight_decay=0.00001)
 loss=torch.nn.MSELoss(reduction="none")
 for e in range(N):
 	epoch_loss=epoch_batch=epoch_embedding_loss=epoch_state_loss=0.0
+
+	#print(rnn_parameters["weight_ih_l0"])
 	for i,batch in enumerate(train_loader,0):
+			#print(rnn_parameters["weight_ih_l0"])
 			optimiser.zero_grad()
 			features,labels,lengths=batch
-			embeddings=embedding_matrix(torch.tensor(features)).permute(1,0,2)
+			embeddings=embedding_matrix(torch.tensor(features)).permute(1,0,2).cuda()
 			_,output=rnn_forward(rnn_cell,H0,embeddings)
-			Ai,b=rnn_backward_parameters(rnn_cell)
+			Ai,b=rnn_backward_parameters(rnn_cell,rnn_parameters)
 			predicted_embeddings,predicted_output=rnn_backward(Ai,b,output,lengths,H,E)
 			output=torch.cat((H0,output))
 			# compute embedding reconstruction loss
 			embedding_loss=loss(embeddings.permute(1,0,2),predicted_embeddings.permute(1,0,2))
 			embedding_loss=torch.sum(embedding_loss,2)
-			embedding_mask=~torch.eq(torch.tensor(features),V-1)
+			embedding_mask=~torch.eq(torch.tensor(features),V-1).cuda()
 			embedding_loss=torch.masked_select(embedding_loss,embedding_mask)
 			embedding_loss=torch.mean(embedding_loss)/E
 			# compute recurrent state reconstruction loss
 			state_loss=loss(output.permute(1,0,2),predicted_output.permute(1,0,2))
 			state_loss=torch.sum(state_loss,2)
-			true_column=torch.tensor((),dtype=torch.bool).new_ones((B,1))
+			true_column=torch.tensor((),dtype=torch.bool).new_ones((B,1)).cuda()
 			state_mask=torch.cat((true_column,embedding_mask),1)
 			state_loss=torch.masked_select(state_loss,state_mask)
 			state_loss=torch.mean(state_loss)/H
-			batch_loss=(alpha*embedding_loss+beta*state_loss)
+			l2_loss=gamma_ih*compute_l2_loss(torch.norm(rnn_parameters["weight_ih_l0"]))/(E*H)+gamma_hh*compute_l2_loss(torch.norm(rnn_parameters["weight_hh_l0"]))/(H*H)
+			batch_loss=(alpha*embedding_loss+beta*state_loss+l2_loss)
 			if torch.isnan(batch_loss).any(): raise ValueError("Loss is NaN. Exiting...")
 			if torch.isinf(batch_loss).any(): raise ValueError("Loss is Inf. Exiting...")
 			batch_loss.backward()
+			#print(torch.norm(rnn_parameters["weight_hh_l0"])/(H*H))
+			#print(torch.norm(rnn_parameters["weight_ih_l0"])/(E*H))
 			optimiser.step()
 			epoch_loss=epoch_loss+batch_loss.item()
 			epoch_batch=epoch_batch+1.0
